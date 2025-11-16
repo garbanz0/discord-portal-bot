@@ -4,32 +4,34 @@ import {
   GatewayIntentBits,
   Partials,
   ChannelType,
-  PermissionFlagsBits
+  PermissionFlagsBits,
 } from 'discord.js';
 
 const {
   DISCORD_TOKEN,
-  STAFF_ROLE_ID,                         // optional but recommended
-  CATEGORY_PREFIX = 'client-',           // category prefix per user
-  CHANNEL_NAMES = 'ticket,support,files' // 3 channels by default
+  STAFF_ROLE_ID,                           // optional but recommended
+  CATEGORY_PREFIX = 'client-',             // category prefix per user
+  CHANNEL_NAMES = 'Important contact information,Markups,General',  // default 3 text channels
 } = process.env;
 
 if (!DISCORD_TOKEN) {
-  console.error('Missing DISCORD_TOKEN');
+  console.error('❌ Missing DISCORD_TOKEN in environment variables.');
   process.exit(1);
 }
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers // required for guildMemberAdd
+    GatewayIntentBits.GuildMembers, // required for guildMemberAdd
   ],
-  partials: [Partials.GuildMember, Partials.User]
+  partials: [Partials.GuildMember, Partials.User],
 });
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
+
+// ----- helpers -----
 
 function categoryNameFor(member) {
   const short = member.id.slice(-4);
@@ -37,9 +39,13 @@ function categoryNameFor(member) {
   return `${CATEGORY_PREFIX}${safe}-${short}`;
 }
 
+// Build permission overwrites safely.
+// - Hides from @everyone
+// - Grants the new member access
+// - Grants Staff role access if STAFF_ROLE_ID is set *and exists* in the guild
 function overwritesFor(guild, member) {
-  const ow = [
-    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }, // hide from everyone
+  const base = [
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }, // @everyone hidden
     {
       id: member.id,
       allow: [
@@ -47,31 +53,35 @@ function overwritesFor(guild, member) {
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.ReadMessageHistory,
         PermissionFlagsBits.AttachFiles,
-        PermissionFlagsBits.EmbedLinks
-      ]
-    }
+        PermissionFlagsBits.EmbedLinks,
+      ],
+    },
   ];
-  if (STAFF_ROLE_ID) {
-    ow.push({
-      id: STAFF_ROLE_ID,
+
+  const staffId = (STAFF_ROLE_ID || '').trim();
+  if (staffId && guild.roles.cache.has(staffId)) {
+    base.push({
+      id: staffId,
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.ManageMessages
-      ]
+        PermissionFlagsBits.ManageMessages, // optional but handy for staff
+      ],
     });
   }
-  return ow;
+
+  return base;
 }
 
-async function ensurePortal(member) {
+// Create (or ensure) the category + channels for a member
+async function ensurePortal(member, reason = 'auto-create portal on join') {
   const guild = member.guild;
   const catName = categoryNameFor(member);
   const channelNames = CHANNEL_NAMES.split(',').map(s => s.trim()).filter(Boolean);
   if (channelNames.length === 0) throw new Error('CHANNEL_NAMES is empty');
 
-  // find or create category
+  // Create or reuse category
   let category = guild.channels.cache.find(
     ch => ch.type === ChannelType.GuildCategory && ch.name === catName
   );
@@ -81,14 +91,14 @@ async function ensurePortal(member) {
       name: catName,
       type: ChannelType.GuildCategory,
       permissionOverwrites: overwritesFor(guild, member),
-      reason: 'auto-create portal on join'
+      reason,
     });
   } else {
-    // refresh perms in case role/user perms changed
+    // Refresh perms in case Staff role changed later
     await category.permissionOverwrites.set(overwritesFor(guild, member));
   }
 
-  // create 3 text channels if missing
+  // Ensure each text channel exists
   for (const name of channelNames) {
     const exists = guild.channels.cache.find(
       ch => ch.type === ChannelType.GuildText && ch.parentId === category.id && ch.name === name
@@ -100,30 +110,36 @@ async function ensurePortal(member) {
       type: ChannelType.GuildText,
       parent: category.id,
       permissionOverwrites: overwritesFor(guild, member),
-      reason: 'auto-create portal on join'
+      reason,
     });
   }
 
   return category;
 }
 
-// MAIN: create on join
+// ----- events -----
+
+// For EVERY new member (including Staff), create their private portal.
+// Staff role (if set) will be able to see *everyone's* portals.
 client.on('guildMemberAdd', async (member) => {
   try {
     console.log(`👤 ${member.user.tag} joined ${member.guild.name}`);
-    const category = await ensurePortal(member);
+    const category = await ensurePortal(member, 'auto-on-join');
 
-    // optional: drop a welcome line in the first channel under the category
+    // Optional: send a welcome note in the first text channel under the category
     const first = member.guild.channels.cache.find(
       ch => ch.type === ChannelType.GuildText && ch.parentId === category.id
     );
     if (first) {
+      const staffId = (STAFF_ROLE_ID || '').trim();
       await first.send(
-        `Welcome <@${member.id}> — this private space is visible to you${STAFF_ROLE_ID ? ' and our staff' : ''}.`
+        `Welcome <@${member.id}>! This private space is visible to you${
+          staffId && member.guild.roles.cache.has(staffId) ? ' and our staff' : ''
+        }.`
       );
     }
-  } catch (e) {
-    console.error('Failed to create portal on join:', e);
+  } catch (err) {
+    console.error('❌ Failed to create portal on join:', err);
   }
 });
 
