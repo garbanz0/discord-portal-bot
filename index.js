@@ -10,19 +10,19 @@ import {
 const {
   DISCORD_TOKEN,
   STAFF_ROLE_ID,                           // optional but recommended
-  CATEGORY_PREFIX = 'client-',             // category prefix per user
-  CHANNEL_NAMES = 'Important contact information,Markups,General',  // default 3 text channels
+  CATEGORY_PREFIX = 'client-',
+  CHANNEL_NAMES = 'Markups,General',        // <-- now 2 channels by default
 } = process.env;
 
 if (!DISCORD_TOKEN) {
-  console.error('❌ Missing DISCORD_TOKEN in environment variables.');
+  console.error('❌ Missing DISCORD_TOKEN');
   process.exit(1);
 }
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // required for guildMemberAdd
+    GatewayIntentBits.GuildMembers, // required for join/leave events
   ],
   partials: [Partials.GuildMember, Partials.User],
 });
@@ -31,7 +31,11 @@ client.once('clientReady', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-// ----- helpers -----
+// ---------- helpers ----------
+
+function isValidSnowflake(id) {
+  return typeof id === 'string' && /^[0-9]{17,20}$/.test(id);
+}
 
 function categoryNameFor(member) {
   const short = member.id.slice(-4);
@@ -39,13 +43,12 @@ function categoryNameFor(member) {
   return `${CATEGORY_PREFIX}${safe}-${short}`;
 }
 
-// Build permission overwrites safely.
-// - Hides from @everyone
-// - Grants the new member access
-// - Grants Staff role access if STAFF_ROLE_ID is set *and exists* in the guild
+// Build safe permission overwrites
 function overwritesFor(guild, member) {
+  const everyoneId = guild.roles.everyone.id;
+
   const base = [
-    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }, // @everyone hidden
+    { id: everyoneId, deny: [PermissionFlagsBits.ViewChannel] },
     {
       id: member.id,
       allow: [
@@ -59,14 +62,14 @@ function overwritesFor(guild, member) {
   ];
 
   const staffId = (STAFF_ROLE_ID || '').trim();
-  if (staffId && guild.roles.cache.has(staffId)) {
+  if (isValidSnowflake(staffId) && guild.roles.cache.has(staffId)) {
     base.push({
       id: staffId,
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
         PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.ManageMessages, // optional but handy for staff
+        PermissionFlagsBits.ManageMessages,
       ],
     });
   }
@@ -81,6 +84,8 @@ async function ensurePortal(member, reason = 'auto-create portal on join') {
   const channelNames = CHANNEL_NAMES.split(',').map(s => s.trim()).filter(Boolean);
   if (channelNames.length === 0) throw new Error('CHANNEL_NAMES is empty');
 
+  const perms = overwritesFor(guild, member);
+
   // Create or reuse category
   let category = guild.channels.cache.find(
     ch => ch.type === ChannelType.GuildCategory && ch.name === catName
@@ -90,12 +95,12 @@ async function ensurePortal(member, reason = 'auto-create portal on join') {
     category = await guild.channels.create({
       name: catName,
       type: ChannelType.GuildCategory,
-      permissionOverwrites: overwritesFor(guild, member),
+      permissionOverwrites: perms,
       reason,
     });
   } else {
-    // Refresh perms in case Staff role changed later
-    await category.permissionOverwrites.set(overwritesFor(guild, member));
+    // refresh perms (e.g., staff role changed)
+    await category.permissionOverwrites.set(perms);
   }
 
   // Ensure each text channel exists
@@ -109,7 +114,7 @@ async function ensurePortal(member, reason = 'auto-create portal on join') {
       name,
       type: ChannelType.GuildText,
       parent: category.id,
-      permissionOverwrites: overwritesFor(guild, member),
+      permissionOverwrites: perms,
       reason,
     });
   }
@@ -117,29 +122,93 @@ async function ensurePortal(member, reason = 'auto-create portal on join') {
   return category;
 }
 
-// ----- events -----
+// Find all categories that belong to a member (robust even if username changes)
+// Strategy: match CATEGORY_PREFIX and check permission overwrites include the member.
+function findMemberCategories(guild, member) {
+  const cats = guild.channels.cache.filter(
+    ch =>
+      ch.type === ChannelType.GuildCategory &&
+      ch.name.startsWith(CATEGORY_PREFIX) &&
+      ch.permissionOverwrites?.cache?.has(member.id)
+  );
+  return Array.from(cats.values());
+}
 
-// For EVERY new member (including Staff), create their private portal.
-// Staff role (if set) will be able to see *everyone's* portals.
+// Delete a member's portal(s) on leave
+async function deletePortal(member, reason = 'member left – clean up portal') {
+  const guild = member.guild;
+  const categories = findMemberCategories(guild, member);
+
+  for (const category of categories) {
+    try {
+      // delete children first
+      const children = guild.channels.cache.filter(ch => ch.parentId === category.id);
+      for (const [, child] of children) {
+        try {
+          await child.delete(reason);
+        } catch (e) {
+          console.warn(`⚠️ Failed deleting child channel ${child.name}:`, e?.code || e?.message || e);
+        }
+      }
+
+      // delete category
+      await category.delete(reason);
+      console.log(`🧹 Deleted portal category ${category.name} for ${member.user.tag}`);
+    } catch (e) {
+      console.warn(`⚠️ Failed deleting category ${category.name}:`, e?.code || e?.message || e);
+    }
+  }
+
+  if (!categories.length) {
+    // fallback: try name pattern match using snowflake suffix (last 4 digits)
+    const suffix = `-${member.id.slice(-4)}`;
+    const guess = guild.channels.cache.filter(
+      ch => ch.type === ChannelType.GuildCategory && ch.name.endsWith(suffix) && ch.name.startsWith(CATEGORY_PREFIX)
+    );
+    for (const [, category] of guess) {
+      try {
+        const children = guild.channels.cache.filter(ch => ch.parentId === category.id);
+        for (const [, child] of children) await child.delete(reason);
+        await category.delete(reason);
+        console.log(`🧹 Deleted guessed portal category ${category.name} for ${member.user.tag}`);
+      } catch (e) {
+        console.warn(`⚠️ Failed deleting guessed category ${category.name}:`, e?.code || e?.message || e);
+      }
+    }
+  }
+}
+
+// ---------- events ----------
+
+// Create 2 private channels for EVERY new member (staff can see all if STAFF_ROLE_ID set)
 client.on('guildMemberAdd', async (member) => {
   try {
     console.log(`👤 ${member.user.tag} joined ${member.guild.name}`);
     const category = await ensurePortal(member, 'auto-on-join');
 
-    // Optional: send a welcome note in the first text channel under the category
     const first = member.guild.channels.cache.find(
       ch => ch.type === ChannelType.GuildText && ch.parentId === category.id
     );
+
     if (first) {
       const staffId = (STAFF_ROLE_ID || '').trim();
+      const hasStaff = isValidSnowflake(staffId) && member.guild.roles.cache.has(staffId);
       await first.send(
-        `Welcome <@${member.id}>! This private space is visible to you${
-          staffId && member.guild.roles.cache.has(staffId) ? ' and our staff' : ''
-        }.`
+        `Welcome <@${member.id}>! This private space is visible to you${hasStaff ? ' and our staff' : ''}.`
       );
     }
   } catch (err) {
     console.error('❌ Failed to create portal on join:', err);
+  }
+});
+
+// Clean up when a member leaves
+client.on('guildMemberRemove', async (member) => {
+  try {
+    console.log(`🚪 ${member.user.tag} left ${member.guild.name} — cleaning up portal`);
+    await deletePortal(member);
+  } catch (err) {
+    console.error('❌ Failed to delete portal on leave:', err);
   }
 });
 
